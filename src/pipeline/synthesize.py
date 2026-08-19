@@ -3,8 +3,8 @@
 import json
 import random
 from typing import List, Dict
-from config import paths
-from extraction import EscoExtractor, EscoOccupation, EscoSkill
+from src.core.config import paths
+from src.pipeline.extraction import EscoExtractor, EscoOccupation, EscoSkill
 
 
 class SkillsExample:
@@ -97,7 +97,7 @@ class DatasetSynthesizer:
         )
 
 
-def main():
+def run():
     extractor = EscoExtractor(
         skills_path=paths.raw_esco_skills,
         occupations_path=paths.raw_esco_occupations,
@@ -114,5 +114,4 @@ def main():
     print(f"Wrote {len(synthesizer.examples)} examples to {paths.processed_dataset}")
 
 
-if __name__ == "__main__":
-    main()
+

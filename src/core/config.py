@@ -13,7 +13,7 @@ class PathsConfig:
 
 @dataclass
 class TrainingConfig:
-    base_model_name: str = "meta-llama/Llama-3.2-3B-Instruct"
+    base_model_name: str = "unsloth/Llama-3.2-3B-Instruct"
     output_dir: str = "models/checkpoints/llama3.2-3b-esco-json"
     num_epochs: int = 3
     learning_rate: float = 2e-4

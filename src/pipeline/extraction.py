@@ -1,11 +1,10 @@
-# src/extract.py
+# src/pipeline/extraction.py
 
 import csv
 import json
 from pathlib import Path
 from typing import Dict, List
-from config import paths
-
+from src.core.config import paths
 
 class EscoSkill:
     def __init__(self, skill_id: str, name: str, alt_labels: List[str]):
@@ -158,7 +157,7 @@ class CsvExtractor:
                     occupation.skill_ids.append(skill_id)
 
 
-def main():
+def run():
     source_dir = Path("data/raw/ESCO dataset - v1.2.1 - classification - en - csv")
     extractor = CsvExtractor(
         skills_csv=str(source_dir / "skills_en.csv"),
@@ -175,4 +174,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run()
+
