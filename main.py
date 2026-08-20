@@ -1,36 +1,46 @@
+# main.py
+
 import argparse
 from importlib import import_module
 
-
 STAGES = {
-    "01": ("src.pipeline.extraction", "Step 01: Extraction"),
-    "02": ("src.pipeline.synthesize", "Step 02: Synthesis"),
-    "03": ("src.pipeline.split", "Step 03: Split"),
-    "04": ("src.pipeline.train", "Step 04: Training"),
-    "05": ("src.pipeline.evaluate", "Step 05: Evaluation"),
-    "06": ("src.pipeline.evaluate", "Step 06: Evaluation"),
-    "07": ("src.pipeline.inference", "Step 07: Inference"),
+    "01": ("src.extraction", "Step 01: Extraction"),
+    "02": ("src.synthesize", "Step 02: Synthesis"),
+    "03": ("src.split", "Step 03: Dataset Split"),
+    "04": ("src.train", "Step 04: LoRA Training"),
+    "05": ("src.pipeline.evaluate", "Step 05: Model Evaluation"),
+    "06": ("src.pipeline.evaluate_gemini", "Step 06: Gemini Model Evaluation"),
+    "07": ("src.pipeline.export", "Step 07: Export LoRA Adapter"),
 }
+
 
 def run_stage(stage: str) -> None:
     module_name, label = STAGES[stage]
-    print(label)
-    import_module(module_name).run()
+    print(f"\n{'=' * 40}")
+    print(f" Running {label}")
+    print(f"{'=' * 40}\n")
+    module = import_module(module_name)
+    if hasattr(module, "run"):
+        module.run()
+    elif hasattr(module, "upload_lora"):
+        module.upload_lora()
+    else:
+        raise AttributeError(f"Module '{module_name}' does not define a 'run()' or 'upload_lora()' function.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the ESCO model pipeline.")
+    parser = argparse.ArgumentParser(description="Run the FT_MODEL2 training and evaluation pipeline.")
     parser.add_argument(
         "stage",
         nargs="?",
-        choices=[*STAGES, "all"],
+        choices=[*STAGES.keys(), "all"],
         default="all",
-        help="pipeline stage to run (default: all)",
+        help="Pipeline stage to run (default: all)",
     )
     args = parser.parse_args()
 
-    stages = STAGES if args.stage == "all" else (args.stage,)
-    for stage in stages:
+    stages_to_run = list(STAGES.keys()) if args.stage == "all" else [args.stage]
+    for stage in stages_to_run:
         run_stage(stage)
 
 
