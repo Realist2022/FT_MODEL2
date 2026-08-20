@@ -74,14 +74,10 @@ class ResponseParser:
 
     @staticmethod
     def split_prompt_and_ground_truth(record: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        """Reconstructs the prompt format used in JsonDatasetWrapper (train.py)
-
-        and separates the ground truth target output.
-        """
+        """Reconstructs the prompt format used during training and separates the ground truth."""
         instruction = record.get("instruction", "")
         ground_truth = record.get("output", {})
 
-        # Recreate exact prompt template from train.py
         prompt = (
             "You are a strict JSON generator.\n"
             "Given the instruction, output ONLY the JSON object.\n\n"
@@ -90,3 +86,34 @@ class ResponseParser:
         )
 
         return prompt, ground_truth
+
+
+def run() -> None:
+    """Standalone run entry point for inference test."""
+    from src.core.config import training
+
+    print(f"Loading checkpoint from: {training.output_dir}")
+    runner = ModelRunner(model_path=training.output_dir)
+
+    sample_instruction = (
+        "Role: Software Engineer\n"
+        "Job Requirements: Python, FastAPI, Docker, SQL\n"
+        "Candidate Skills: Python, SQL, Git"
+    )
+    prompt = (
+        "You are a strict JSON generator.\n"
+        "Given the instruction, output ONLY the JSON object.\n\n"
+        f"Instruction:\n{sample_instruction}\n\n"
+        "JSON output:\n"
+    )
+
+    print("\n--- Generating sample inference ---")
+    raw_output = runner.generate(prompt)
+    parsed = ResponseParser.extract_json(raw_output)
+
+    print("\nRaw Output:\n", raw_output)
+    print("\nParsed JSON:\n", json.dumps(parsed, indent=2) if parsed else "Failed to parse JSON")
+
+
+if __name__ == "__main__":
+    run()
