@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 from unsloth import FastLanguageModel
@@ -30,6 +30,16 @@ class ModelRunner:
         )
         FastLanguageModel.for_inference(model)
         return model, tokenizer
+
+    def generate_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Generates from chat messages using the model's own chat template,
+        exactly as Ollama's OpenAI-compatible endpoint will at serving time."""
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return self.generate(prompt)
 
     def generate(self, prompt: str) -> str:
         inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
@@ -73,19 +83,16 @@ class ResponseParser:
             return None
 
     @staticmethod
-    def split_prompt_and_ground_truth(record: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        """Reconstructs the prompt format used during training and separates the ground truth."""
-        instruction = record.get("instruction", "")
-        ground_truth = record.get("output", {})
-
-        prompt = (
-            "You are a strict JSON generator.\n"
-            "Given the instruction, output ONLY the JSON object.\n\n"
-            f"Instruction:\n{instruction}\n\n"
-            "JSON output:\n"
-        )
-
-        return prompt, ground_truth
+    def split_messages_and_ground_truth(
+        record: Dict[str, Any]
+    ) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+        """Splits a {"messages": [...]} record into the prompt messages
+        (system + user) and the parsed assistant JSON ground truth."""
+        messages = record["messages"]
+        prompt_messages = [m for m in messages if m["role"] != "assistant"]
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        ground_truth = json.loads(assistant["content"])
+        return prompt_messages, ground_truth
 
 
 def run() -> None:
@@ -95,20 +102,32 @@ def run() -> None:
     print(f"Loading checkpoint from: {training.output_dir}")
     runner = ModelRunner(model_path=training.output_dir)
 
-    sample_instruction = (
-        "Role: Software Engineer\n"
-        "Job Requirements: Python, FastAPI, Docker, SQL\n"
-        "Candidate Skills: Python, SQL, Git"
+    from src.pipeline.synthesize import SKILL_MATCHER_SYSTEM_PROMPT
+
+    requirements = json.dumps(
+        [
+            {"requirement_id": 0, "skill_name": "Python"},
+            {"requirement_id": 1, "skill_name": "FastAPI"},
+            {"requirement_id": 2, "skill_name": "Docker"},
+            {"requirement_id": 3, "skill_name": "SQL"},
+        ],
+        ensure_ascii=False,
     )
-    prompt = (
-        "You are a strict JSON generator.\n"
-        "Given the instruction, output ONLY the JSON object.\n\n"
-        f"Instruction:\n{sample_instruction}\n\n"
-        "JSON output:\n"
+    cv_text = (
+        "PROFESSIONAL SUMMARY\n"
+        "Software developer with 5 years of experience.\n\n"
+        "WORK EXPERIENCE\n\n"
+        "Software Engineer - Harbourview Group (Jan 2021 - Present)\n"
+        "- Built internal services in Python with SQL-backed reporting.\n"
+        "- Maintained Git workflows across the team."
     )
+    messages = [
+        {"role": "system", "content": SKILL_MATCHER_SYSTEM_PROMPT},
+        {"role": "user", "content": f"JOB REQUIREMENTS:\n{requirements}\n\nCANDIDATE CV:\n{cv_text}"},
+    ]
 
     print("\n--- Generating sample inference ---")
-    raw_output = runner.generate(prompt)
+    raw_output = runner.generate_chat(messages)
     parsed = ResponseParser.extract_json(raw_output)
 
     print("\nRaw Output:\n", raw_output)

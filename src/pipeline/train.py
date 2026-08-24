@@ -1,5 +1,6 @@
 import os
-from typing import Dict
+from typing import Dict, List
+
 from datasets import load_dataset
 from dotenv import load_dotenv
 
@@ -12,20 +13,20 @@ from unsloth import FastLanguageModel, is_bfloat16_supported
 from trl.trainer.sft_config import SFTConfig
 from trl.trainer.sft_trainer import SFTTrainer
 
-# Correct collator for JSON SFT
-from transformers import DataCollatorForLanguageModeling
+# Pads input_ids with the pad token and labels with -100, keeping the
+# prompt-masking below intact. (DataCollatorForLanguageModeling would
+# rebuild labels from input_ids and silently undo the masking.)
+from transformers import DataCollatorForSeq2Seq
 
 from src.core.config import paths, training
 
 
-def json_dumps_compact(obj: Dict) -> str:
-    import json
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-
-
-class JsonDatasetWrapper:
+class ChatDatasetWrapper:
     """
-    Wraps HF dataset to return prompt + target text.
+    Tokenizes {"messages": [system, user, assistant]} examples with the
+    model's own chat template so training matches how Ollama serves the
+    model, masks the prompt tokens in the labels, and guarantees an EOS
+    token after the assistant JSON so generation stops after one object.
     """
 
     def __init__(self, hf_dataset, tokenizer, max_length: int):
@@ -34,27 +35,35 @@ class JsonDatasetWrapper:
         self.max_length = max_length
 
     def _format_example(self, example: Dict) -> Dict:
-        instruction = example["instruction"]
-        output_json = example["output"]
+        messages: List[Dict] = example["messages"]
 
-        target_str = json_dumps_compact(output_json)
-
-        prompt = (
-            "You are a strict JSON generator.\n"
-            "Given the instruction, output ONLY the JSON object.\n\n"
-            f"Instruction:\n{instruction}\n\n"
-            "JSON output:\n"
+        prompt_ids = self.tokenizer.apply_chat_template(
+            messages[:-1],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=False,
+        )
+        full_ids = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=False,
         )
 
-        text = prompt + target_str
+        if full_ids[-1] != self.tokenizer.eos_token_id:
+            full_ids = full_ids + [self.tokenizer.eos_token_id]
 
-        tokenized = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_length,
-        )
-        tokenized["labels"] = tokenized["input_ids"].copy()
-        return tokenized
+        full_ids = full_ids[: self.max_length]
+        prompt_len = min(len(prompt_ids), len(full_ids))
+
+        # Loss only on the assistant JSON (and its EOS), never on the prompt.
+        labels = [-100] * prompt_len + full_ids[prompt_len:]
+
+        return {
+            "input_ids": full_ids,
+            "attention_mask": [1] * len(full_ids),
+            "labels": labels,
+        }
 
     def map(self):
         return self.dataset.map(self._format_example, remove_columns=self.dataset.column_names)
@@ -71,7 +80,7 @@ def run():
     wandb_api_key = os.getenv("WANDB_API_KEY")
     if wandb_api_key:
         wandb.login(key=wandb_api_key)
-        wandb.init(project="esco-json-eval", name="llama3.2-json-v1")
+        wandb.init(project="esco-json-eval", name="llama3.2-json-v2-chat")
 
     # -----------------------------
     # 1. Load model + tokenizer
@@ -110,12 +119,12 @@ def run():
         }
     )
 
-    train_wrapper = JsonDatasetWrapper(
+    train_wrapper = ChatDatasetWrapper(
         hf_dataset=hf_dataset["train"],
         tokenizer=tokenizer,
         max_length=training.max_seq_length,
     )
-    val_wrapper = JsonDatasetWrapper(
+    val_wrapper = ChatDatasetWrapper(
         hf_dataset=hf_dataset["validation"],
         tokenizer=tokenizer,
         max_length=training.max_seq_length,
@@ -125,11 +134,12 @@ def run():
     tokenized_val = val_wrapper.map()
 
     # -----------------------------
-    # 4. Correct data collator
+    # 4. Data collator (keeps label masking)
     # -----------------------------
-    data_collator = DataCollatorForLanguageModeling(
+    data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
-        mlm=False,  # causal LM, not masked LM
+        padding=True,
+        label_pad_token_id=-100,
     )
 
     # -----------------------------

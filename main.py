@@ -4,10 +4,10 @@ import argparse
 from importlib import import_module
 
 STAGES = {
-    "01": ("src.extraction", "Step 01: Extraction"),
-    "02": ("src.synthesize", "Step 02: Synthesis"),
-    "03": ("src.split", "Step 03: Dataset Split"),
-    "04": ("src.train", "Step 04: LoRA Training"),
+    "01": ("src.pipeline.extraction", "Step 01: Extraction"),
+    "02": ("src.pipeline.synthesize", "Step 02: Synthesis"),
+    "03": ("src.pipeline.split", "Step 03: Dataset Split"),
+    "04": ("src.pipeline.train", "Step 04: LoRA Training"),
     "05": ("src.pipeline.evaluate", "Step 05: Model Evaluation"),
     "06": ("src.pipeline.evaluate_gemini", "Step 06: Gemini Model Evaluation"),
     "07": ("src.pipeline.export", "Step 07: Export LoRA Adapter"),
