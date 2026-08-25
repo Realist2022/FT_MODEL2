@@ -1,10 +1,18 @@
 # src/pipeline/synthesize.py
 
 import json
+import os
 import random
-from typing import Dict, List, Optional, Tuple
+import time
+from pathlib import Path
+from textwrap import dedent
+from typing import Dict, List, Optional, Tuple, Type
 
-from src.core.config import paths
+from pydantic import BaseModel
+from tqdm import tqdm
+
+from src.core.config import paths, synthesis
+from src.core.schema import JobRequirementsOutput, OverallExperienceResponse, SkillEvaluationDecision
 from src.pipeline.extraction import EscoExtractor, EscoOccupation, EscoSkill
 
 # ---------------------------------------------------------------------------
@@ -13,23 +21,36 @@ from src.pipeline.extraction import EscoExtractor, EscoOccupation, EscoSkill
 # match the served prompts byte-for-byte.
 # ---------------------------------------------------------------------------
 
-SKILL_MATCHER_SYSTEM_PROMPT = """Evaluate whether a candidate's CV satisfies each supplied job requirement.
-
-Return exactly one evaluation for every numeric requirement_id supplied.
-Set matched to true when the CV explicitly shows the skill_name or a directly equivalent skill_name.
-Set matched to false when the CV does not show sufficient evidence.
-Evaluate skill_name only. Do not require dated or commercial evidence here.
-Do not extract, rename, summarize, or introduce skills in the evaluations.
-
-Treat specific tools or certifications as evidence for a broader requirement only when they directly fulfill it."""
-
 JOB_REQUIREMENTS_SYSTEM_PROMPT = """Extract atomic technical and operational skill_names from a job description.
 
 Include specific domain tools, machinery, software, methodologies, frameworks, certifications, and technical skill_names.
 Exclude generic soft skills such as hard working, communication, teamwork, and punctuality.
+Exclude vague qualitative descriptors that name no specific technology, tool, or named
+methodology, such as "modern development practices", "modern engineering practices",
+"modern web applications", or "fast-paced environment" — these are not independently
+verifiable against a CV. Keep concrete, named methodologies and practices such as
+"Agile", "CI/CD", "code reviews", or "test-driven development".
 Return one skill_name per record. Split all combined requirements into separate records.
 The skill_name field must contain only the skill name, without years-of-experience wording.
 Return each unique skill_name once, grounded only in the job description.
+
+When a requirement names a general category followed by a specific example marked as
+optional or preferred (in parentheses, or after "e.g."/"such as"/"including"), extract
+only the general category as the skill_name and drop the example and its qualifier.
+Example: "Exposure to cloud technologies (AWS preferred)" -> skill_name: "Cloud technologies".
+Do not create a second record for the example in this case.
+Only extract the specific named technology on its own when the text requires that
+technology directly, not merely as an example of a broader category.
+
+When a requirement names a general category and then states the exact required
+instantiation of that category in the same sentence (e.g. via "specifically
+requiring", "specifically", or by naming the only acceptable tool/method), treat
+the general category and the specific instantiation as ONE requirement, not two.
+Extract only the specific instantiation as the skill_name, and do not create a
+separate record for the general category that wraps it.
+Example: "A strong foundation in digital literacy, specifically requiring 2 years
+of experience using Google Workspace for Education" -> skill_name: "Google
+Workspace for Education". Do not also create a record for "digital literacy".
 
 Expected JSON structure:
 {
@@ -44,6 +65,46 @@ Expected JSON structure:
 }
 """
 
+SKILL_MATCHER_SYSTEM_PROMPT = """Evaluate whether a candidate's CV satisfies each supplied job requirement.
+
+Return exactly one evaluation for every numeric requirement_id supplied.
+Set matched to true when the CV explicitly shows the skill_name or a directly equivalent skill_name.
+Set matched to false when the CV does not show sufficient evidence.
+Evaluate skill_name only. Do not require dated or commercial evidence here.
+Do not extract, rename, summarize, or introduce skills in the evaluations.
+
+Treat specific tools or certifications as evidence for a broader requirement only when they directly fulfill it.
+
+Apply category-inclusion reasoning: when a requirement names a general category or
+practice, a specific CV item that is a well-known member of that category counts as
+a match, even if the CV never uses the requirement's exact wording.
+- "Relational databases" is satisfied by any named relational database the CV lists
+  (e.g. MySQL, PostgreSQL, SQLite, Oracle, SQL Server), not only PostgreSQL itself.
+- "Cloud technologies" is satisfied by any named cloud provider or service the CV
+  lists (e.g. AWS, Azure, GCP), even under a different section heading such as
+  "DevOps & Cloud".
+- A practice-based requirement such as "AI-assisted software development" is
+  satisfied by concrete CV evidence of that practice — a project description,
+  tool, or self-description naming AI/LLM/chatbot work — not only by the literal
+  phrase appearing in the CV.
+- A professional registration or licensing requirement (e.g. "New Zealand
+  Practising Certificate") is satisfied by CV evidence of full registration or
+  licensure with the relevant regulatory body, even when worded differently
+  (e.g. "Fully Registered Teacher (NZTC)").
+- A jurisdiction- or system-specific experience requirement (e.g. "teaching
+  experience in a New Zealand secondary school") is satisfied by CV evidence
+  that uses that jurisdiction's characteristic terminology, curriculum, or role
+  titles (e.g. NCEA levels, a Wellington-based school, Dean/Form Teacher roles),
+  even without the literal phrase appearing.
+
+These are illustrative examples from a few domains, not an exhaustive list — apply
+the same category-inclusion and equivalent-terminology reasoning in whatever
+professional domain the CV and requirement belong to (medicine, trades, education,
+finance, etc.), not only software or technology.
+
+Ground every match in text that actually appears in the CV. Do not infer a category
+match from a requirement alone, and do not invent CV content that is not present."""
+
 OVERALL_EXPERIENCE_SYSTEM_PROMPT = """Extract and classify the candidate's professional work experience against a target job.
 
 1. Extract target job information from the job description:
@@ -51,7 +112,12 @@ OVERALL_EXPERIENCE_SYSTEM_PROMPT = """Extract and classify the candidate's profe
 - Extract target_overall_years from explicit minimum overall experience only.
 - If the job description states a single minimum such as "3+ years", use that number.
 - If a range is given such as "2-5 years", use the lower bound.
-- If no minimum overall experience is stated, set target_overall_years to null.
+- Treat a years figure as the overall requirement even when it is phrased alongside
+  the role's core/primary technologies (e.g. "2-5 years' commercial experience with
+  React and Node.js" -> target_overall_years: 2), since that is the role's experience bar.
+- Only leave target_overall_years null when years are tied to a narrow, secondary
+  tool/certification unrelated to the role's main responsibilities, or no years figure
+  appears anywhere in the listing.
 
 2. Extract candidate roles from the CV:
 - Extract ONLY paid employment or professional contractor work experience.
@@ -63,6 +129,7 @@ OVERALL_EXPERIENCE_SYSTEM_PROMPT = """Extract and classify the candidate's profe
 
 3. Classify relevance for each role:
 - Set is_relevant true only when the role provides directly transferable experience to the target job's responsibilities.
+- Base is_relevant on the role's full set of listed duties/bullets, not just one representative bullet — a role is relevant if ANY of its responsibilities directly matches a target job responsibility, even if other bullets in the same role do not.
 - Provide a brief, evidence-based match_rationale referencing specific job responsibilities and specific CV experience.
 - Do not use generic statements such as "software experience is relevant".
 - Do not assume skills or responsibilities not present in the text.
@@ -94,6 +161,248 @@ Expected JSON structure:
 
 def compact_json(obj: Dict) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# ESCO skill names are conventionally bare-infinitive verb phrases ("manage
+# artistic career", "develop strategy to solve problems") -- but CvWriter's
+# SKILL_BULLETS templates all supply their own leading verb/preposition
+# ("Applied {skill}...", "Trained ... in {skill}."), so a literal skill name
+# collides with it the same way an ungoverned LLM paraphrase did (see
+# SkillParaphraser._PROMPT's comment). This table rewrites the leading verb
+# to its gerund form ("managing artistic career") so it reads as a noun
+# phrase in every template slot instead. It only fires on skills that are
+# NOT going through SkillParaphraser (which already produces gerund/noun
+# phrases directly) -- see _surface_form.
+#
+# Deliberately conservative, not a general English conjugator: this lookup
+# covers the ~100 most frequent leading verbs across the actual ESCO
+# taxonomy (data/raw/esco_skills.json), measured directly rather than
+# guessed -- together they cover roughly 60% of all skill-name leading
+# words. Anything not in the table (including genuine noun-phrase skill
+# names like "PostgreSQL" or "customer service") is left completely
+# unchanged rather than guessed at.
+# ---------------------------------------------------------------------------
+
+_LEADING_VERB_GERUNDS: Dict[str, str] = {
+    "manage": "managing", "operate": "operating", "perform": "performing",
+    "maintain": "maintaining", "use": "using", "develop": "developing",
+    "monitor": "monitoring", "provide": "providing", "apply": "applying",
+    "prepare": "preparing", "advise": "advising", "ensure": "ensuring",
+    "design": "designing", "create": "creating", "understand": "understanding",
+    "tend": "tending", "conduct": "conducting", "analyse": "analysing",
+    "assess": "assessing", "install": "installing", "write": "writing",
+    "handle": "handling", "inspect": "inspecting", "identify": "identifying",
+    "supervise": "supervising", "work": "working", "assist": "assisting",
+    "plan": "planning", "teach": "teaching", "carry": "carrying",
+    "coordinate": "coordinating", "set": "setting", "interact": "interacting",
+    "test": "testing", "evaluate": "evaluating", "check": "checking",
+    "promote": "promoting", "organise": "organising", "follow": "following",
+    "repair": "repairing", "implement": "implementing", "clean": "cleaning",
+    "select": "selecting", "communicate": "communicating", "sell": "selling",
+    "keep": "keeping", "interpret": "interpreting", "assemble": "assembling",
+    "adjust": "adjusting", "control": "controlling", "support": "supporting",
+    "make": "making", "liaise": "liaising", "determine": "determining",
+    "collect": "collecting", "oversee": "overseeing", "report": "reporting",
+    "train": "training", "define": "defining", "remove": "removing",
+    "calculate": "calculating", "measure": "measuring", "negotiate": "negotiating",
+    "process": "processing", "adapt": "adapting", "produce": "producing",
+    "examine": "examining", "prevent": "preventing", "study": "studying",
+    "build": "building", "cut": "cutting", "comply": "complying",
+    "read": "reading", "research": "researching", "demonstrate": "demonstrating",
+    "administer": "administering", "transfer": "transferring", "execute": "executing",
+    "record": "recording", "lead": "leading", "draw": "drawing",
+    "drive": "driving", "diagnose": "diagnosing", "attend": "attending",
+    "participate": "participating", "estimate": "estimating", "instruct": "instructing",
+    "establish": "establishing", "store": "storing", "treat": "treating",
+    "arrange": "arranging", "review": "reviewing", "take": "taking",
+    "integrate": "integrating",
+}
+
+
+def _gerundize_if_verb_led(phrase: str) -> str:
+    first, _, rest = phrase.partition(" ")
+    gerund = _LEADING_VERB_GERUNDS.get(first.casefold())
+    if gerund is None or not rest:
+        return phrase
+    return f"{gerund} {rest}"
+
+
+# ---------------------------------------------------------------------------
+# Instructor's Mode.JSON schema suffix — reproduced byte-for-byte from
+# instructor/v2/providers/openai/handlers.py (both the OpenAI and streaming
+# handlers build this identically): a system-prompt suffix Instructor
+# appends to every real request, containing the response model's full JSON
+# schema. This is NOT optional flavour text -- CV_to_Job_Guestimator's
+# diagnosis of cv-guestimator's rigid literal-matching found that this exact
+# block, sitting between the developer-authored reasoning instructions and
+# the CV/JD content, measurably changes the model's decisions. A model
+# trained only on the bare system prompt is being trained on a different
+# input distribution than the one it's served at inference time -- this
+# closes that gap the same way build_training_dataset.py does on the
+# consumer side (by capturing/reproducing what Instructor actually sends,
+# rather than hand-approximating it).
+#
+# Only the top-level "title" varies from the response_model's own class
+# name: the skill-matcher agent serves a request-scoped subclass of
+# SkillEvaluationDecision built via create_model("ConstrainedSkillEvaluation
+# Decision", __base__=SkillEvaluationDecision, ...) in the consumer's
+# src/services/agents.py -- the extra validator it adds doesn't change the
+# JSON schema's fields, only its title, which is reproduced with
+# title_override below.
+# ---------------------------------------------------------------------------
+
+
+def _instructor_json_suffix(model: Type[BaseModel], title_override: Optional[str] = None) -> str:
+    schema = model.model_json_schema()
+    if title_override:
+        schema["title"] = title_override
+    return dedent(
+        f"""
+            As a genius expert, your task is to understand the content and provide
+            the parsed objects in json that match the following json_schema:\n
+
+            {json.dumps(schema, indent=2, ensure_ascii=False)}
+
+            Make sure to return an instance of the JSON, not the schema itself
+            """
+    )
+
+
+JOB_REQUIREMENTS_SYSTEM_PROMPT += "\n\n" + _instructor_json_suffix(JobRequirementsOutput)
+SKILL_MATCHER_SYSTEM_PROMPT += "\n\n" + _instructor_json_suffix(
+    SkillEvaluationDecision, title_override="ConstrainedSkillEvaluationDecision"
+)
+OVERALL_EXPERIENCE_SYSTEM_PROMPT += "\n\n" + _instructor_json_suffix(OverallExperienceResponse)
+
+
+class _ParaphraseResponse(BaseModel):
+    phrase: str
+
+
+class SkillParaphraser:
+    """Generates and caches a genuinely differently-worded, real-world
+    equivalent CV phrase for an ESCO skill, via OpenAI.
+
+    Why this exists: without it, every "matched: true" label in the dataset
+    is recoverable by a literal (or ESCO-alt-label) substring check against
+    the CV text (see the consistency-pass comment in
+    DatasetSynthesizer._build_skill_match_example) -- the model is never
+    shown a case where genuinely different wording still satisfies a
+    requirement, so it has no training signal to learn that reasoning from,
+    and the "near-miss distractor" mechanism actively rewards it for
+    treating anything non-literal as false. This closes that gap for a
+    controlled fraction of matched skills (see SynthesisConfig.llm_paraphrase_prob).
+
+    Each rewrite is verified to not just restate the skill name/alt_label
+    before being accepted, and results are cached to disk by skill_id so
+    repeated dataset-build runs don't re-spend API calls on the same skill --
+    ESCO skills repeat heavily across the ~3000 sampled occupations.
+    """
+
+    MODEL = "gpt-4o"
+
+    # This phrase gets substituted into an *existing* CV bullet template that
+    # already supplies its own leading verb/preposition (e.g. "Used {phrase}
+    # to improve turnaround times", "Recognised ... for strong results in
+    # {phrase}") -- see CvWriter.SKILL_BULLETS. So the phrase itself MUST be
+    # a bare noun/gerund phrase, never a clause with its own verb, or the
+    # composed sentence reads as broken ("Used Oversee legal data
+    # compilation...", "results in Expertise in touch typing..."). The
+    # explicit shape instruction + good/bad examples below exist specifically
+    # to prevent that -- an earlier version of this prompt only constrained
+    # length, and GPT-4o would often lead with its own verb.
+    _PROMPT = (
+        "A job requirement is: \"{skill}\".\n"
+        "Write ONE short CV-style NOUN/GERUND PHRASE (roughly 3-10 words, no "
+        "trailing period) describing how a real person's experience would "
+        "satisfy this requirement, WITHOUT using the words \"{skill}\" or "
+        "any of: {alt_labels}.\n"
+        "It must grammatically complete a sentence like \"Responsible for "
+        "___\" or \"Trained others in ___\" -- so it must NOT be a full "
+        "clause and must NOT start with a verb (e.g. \"Managed\", "
+        "\"Oversaw\", \"Ensured\", \"Directed\", \"Led\", \"Tracked\") or a "
+        "phrase like \"Expertise in\" / \"Proficient in\".\n"
+        "Good: \"touch typing at 70+ words per minute\", \"legal document "
+        "compilation using Relativity\", \"OSHA-compliant safety "
+        "inspections\".\n"
+        "Bad (starts with a verb, would read as a broken double-verb once "
+        "slotted into a template): \"Managed touch typing\", \"Oversee "
+        "legal document compilation\", \"Ensured OSHA-compliant safety\".\n"
+        "Lowercase the first word unless it is a proper noun. Name it the "
+        "way it would actually appear on a real CV -- a specific "
+        "certification, system, tool, or concrete duty -- not a generic "
+        "rewording of the requirement's own phrasing."
+    )
+
+    def __init__(self, cache_path: Path):
+        self.cache_path = cache_path
+        self.cache: Dict[str, Optional[str]] = {}
+        if cache_path.exists():
+            self.cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        self._client = None
+
+    def _client_or_create(self):
+        if self._client is None:
+            from openai import OpenAI
+            self._client = OpenAI()  # picks up OPENAI_API_KEY from the environment
+        return self._client
+
+    def get(self, skill: EscoSkill) -> Optional[str]:
+        """Returns a cached/generated paraphrase, or None if generation
+        failed or was rejected -- callers should fall back to the literal
+        name/alt_label in that case."""
+        if skill.skill_id in self.cache:
+            return self.cache[skill.skill_id]
+        phrase = self._generate(skill)
+        self.cache[skill.skill_id] = phrase
+        return phrase
+
+    def _generate(self, skill: EscoSkill, max_retries: int = 3) -> Optional[str]:
+        import openai
+
+        client = self._client_or_create()
+        prompt = self._PROMPT.format(
+            skill=skill.name,
+            alt_labels=", ".join(skill.alt_labels) or "none",
+        )
+        for attempt in range(max_retries):
+            try:
+                response = client.chat.completions.parse(
+                    model=self.MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format=_ParaphraseResponse,
+                )
+                message = response.choices[0].message
+                if message.parsed is None:
+                    # The model refused instead of answering, or the SDK
+                    # couldn't parse a result -- message.refusal carries the
+                    # reason when it's a refusal.
+                    raise ValueError(message.refusal or "no parsed response returned")
+                phrase = message.parsed.phrase.strip()
+                break
+            except openai.RateLimitError:
+                wait = 5 * (attempt + 1)
+                print(f"  [paraphrase] rate limited, waiting {wait}s (attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait)
+            except Exception as exc:
+                print(f"  [paraphrase] {skill.name!r}: generation failed ({exc}); using literal wording")
+                return None
+        else:
+            print(f"  [paraphrase] {skill.name!r}: gave up after {max_retries} rate-limit retries; using literal wording")
+            return None
+
+        banned = {skill.name.casefold(), *(a.casefold() for a in skill.alt_labels)}
+        if not phrase or any(term in phrase.casefold() for term in banned):
+            print(f"  [paraphrase] {skill.name!r}: rewrite still contained the literal term; using literal wording")
+            return None
+        return phrase
+
+    def save(self) -> None:
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cache_path.write_text(
+            json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
 
 class ChatExample:
@@ -149,12 +458,17 @@ class CvWriter:
         "dependability and a willingness to learn.",
     ]
 
+    # None of these may start with a word sharing a lemma with any value in
+    # _LEADING_VERB_GERUNDS ("Applied"/apply, "Used"/use, "Trained"/train
+    # were the three that did -- e.g. a gerundized "use" skill plugged into
+    # the old "Used {skill}..." template produced "Used using X...", the
+    # same double-verb collision _gerundize_if_verb_led exists to prevent).
     SKILL_BULLETS = [
         "Responsible for {skill} across multiple client projects.",
-        "Applied {skill} on a daily basis to support team delivery targets.",
+        "Contributed to {skill} on a daily basis to support team delivery targets.",
         "Gained extensive hands-on experience with {skill} in a fast-paced environment.",
-        "Used {skill} to improve turnaround times and reduce errors.",
-        "Trained and supported junior staff in {skill}.",
+        "Leveraged {skill} to improve turnaround times and reduce errors.",
+        "Mentored junior staff in {skill}.",
         "Delivered work that relied heavily on {skill}.",
         "Took ownership of tasks involving {skill} with minimal supervision.",
         "Completed projects requiring {skill} under tight deadlines.",
@@ -454,16 +768,28 @@ class DatasetSynthesizer:
     three agent roles the fine-tuned model serves in CV_to_Job_Guestimator:
     ~50% skill_match, ~25% requirements, ~25% experience."""
 
-    def __init__(self, extractor: EscoExtractor, num_examples: int = 3000):
+    def __init__(
+        self,
+        extractor: EscoExtractor,
+        num_examples: int = 3000,
+        paraphraser: Optional[SkillParaphraser] = None,
+    ):
         self.extractor = extractor
         self.num_examples = num_examples
         self.examples: List[ChatExample] = []
         self.cv_writer = CvWriter()
         self.ad_writer = JobAdWriter()
+        # None disables the LLM-paraphrase surface form entirely (falls back
+        # to literal name / ESCO alt_label) -- see run()'s OPENAI_API_KEY guard.
+        self.paraphraser = paraphraser
 
     def build_dataset(self) -> None:
         occupations = [o for o in self.extractor.occupations if o.skill_ids]
-        for _ in range(self.num_examples):
+        progress = tqdm(range(self.num_examples), desc="Synthesizing examples", unit="ex")
+        for _ in progress:
+            if self.paraphraser is not None:
+                progress.set_postfix(paraphrase_calls=len(self.paraphraser.cache))
+
             occ = random.choice(occupations)
             skills = self._unique_by_name(self.extractor.get_skills_for_occupation(occ))
             if len(skills) < 3:
@@ -491,13 +817,33 @@ class DatasetSynthesizer:
             seen.setdefault(skill.name.strip().casefold(), skill)
         return list(seen.values())
 
-    @staticmethod
-    def _surface_form(skill: EscoSkill) -> str:
-        """How the skill appears in the CV: usually verbatim, sometimes a
-        directly equivalent alternative label (paraphrase)."""
-        if skill.alt_labels and random.random() < 0.4:
-            return random.choice(skill.alt_labels)
-        return skill.name
+    def _surface_form(self, skill: EscoSkill, allow_llm_paraphrase: bool = False) -> str:
+        """How the skill appears in the CV: usually verbatim, sometimes an
+        ESCO alt_label, and -- for matched skills only, when
+        allow_llm_paraphrase is set and a paraphraser is configured --
+        sometimes a genuinely differently-worded real-world equivalent.
+
+        allow_llm_paraphrase must stay False for distractor/near-miss
+        mentions: those exist specifically to teach the model to reject
+        domain-plausible-but-wrong mentions, which requires them to stay
+        literal/near-literal, not genuinely equivalent-but-different.
+
+        The literal/alt_label path is gerund-converted via
+        _gerundize_if_verb_led (skill.name itself, used for ground-truth
+        matching, is untouched -- only what actually gets rendered into the
+        CV changes). The paraphraser output already comes back as a
+        noun/gerund phrase per its own prompt, so it's returned as-is.
+        """
+        if allow_llm_paraphrase and self.paraphraser and random.random() < synthesis.llm_paraphrase_prob:
+            phrase = self.paraphraser.get(skill)
+            if phrase:
+                return phrase
+        literal = (
+            random.choice(skill.alt_labels)
+            if skill.alt_labels and random.random() < synthesis.alt_label_prob
+            else skill.name
+        )
+        return _gerundize_if_verb_led(literal)
 
     def _other_titles(self, occupations: List[EscoOccupation], exclude_id: str, k: int) -> List[str]:
         return [o.title for o in random.sample(occupations, k=min(len(occupations), k + 1))
@@ -559,7 +905,7 @@ class DatasetSynthesizer:
             near_miss_pool, k=min(len(near_miss_pool), random.randint(0, 2))
         )
 
-        mentions = [self._surface_form(s) for s in matched_skills]
+        mentions = [self._surface_form(s, allow_llm_paraphrase=True) for s in matched_skills]
         mentions += [self._surface_form(s) for s in distractors + near_miss]
         random.shuffle(mentions)
 
@@ -713,14 +1059,35 @@ class DatasetSynthesizer:
 
 
 def run():
+    from dotenv import load_dotenv
+
+    load_dotenv()  # picks up OPENAI_API_KEY the same way evaluate_gemini.py/export.py load their keys
+
     extractor = EscoExtractor(
         skills_path=paths.raw_esco_skills,
         occupations_path=paths.raw_esco_occupations,
     )
     extractor.load()
 
-    synthesizer = DatasetSynthesizer(extractor=extractor, num_examples=3000)
-    synthesizer.build_dataset()
+    paraphraser = None
+    if os.environ.get("OPENAI_API_KEY"):
+        paraphraser = SkillParaphraser(Path(paths.paraphrase_cache))
+    else:
+        print(
+            "⚠️  OPENAI_API_KEY not set: skipping LLM-paraphrase surface forms. "
+            "Matched-skill CV evidence will be literal/ESCO-alt-label only, which "
+            "reproduces the train/inference mismatch documented for cv-guestimator "
+            "(rigid literal matching) -- set OPENAI_API_KEY to fix that for this run."
+        )
+
+    synthesizer = DatasetSynthesizer(extractor=extractor, num_examples=3000, paraphraser=paraphraser)
+    try:
+        synthesizer.build_dataset()
+    finally:
+        # Save whatever got cached even if the run is interrupted partway
+        # through -- these are real, rate-limited API calls, not free to redo.
+        if paraphraser is not None:
+            paraphraser.save()
 
     counts: Dict[str, int] = {}
     with open(paths.processed_dataset, "w", encoding="utf-8") as f:
@@ -731,3 +1098,6 @@ def run():
     print(f"Wrote {len(synthesizer.examples)} examples to {paths.processed_dataset}")
     for task, count in sorted(counts.items()):
         print(f"  {task}: {count}")
+    if paraphraser is not None:
+        generated = sum(1 for v in paraphraser.cache.values() if v)
+        print(f"  paraphrase cache: {generated}/{len(paraphraser.cache)} skills got an LLM-generated surface form")

@@ -10,6 +10,19 @@ class PathsConfig:
     train_file: str = "data/processed/train.jsonl"
     val_file: str = "data/processed/val.jsonl"
     test_file: str = "data/processed/test.jsonl"
+    paraphrase_cache: str = "data/processed/paraphrase_cache.json"
+
+@dataclass
+class SynthesisConfig:
+    # Fraction of MATCHED skill mentions that get a genuinely differently-worded
+    # (LLM-generated) real-world equivalent instead of the literal ESCO name/alt_label,
+    # when an LLM paraphraser is available. Distractors/near-miss mentions never use
+    # this -- they must stay literal/near-literal so the model still learns to reject
+    # domain-plausible-but-wrong mentions. See SkillParaphraser in synthesize.py.
+    llm_paraphrase_prob: float = 0.35
+    # Fraction of matched skills (when not LLM-paraphrased) that use an ESCO alt_label
+    # instead of the preferred name -- unchanged from the original behaviour.
+    alt_label_prob: float = 0.4
 
 @dataclass
 class TrainingConfig:
@@ -22,4 +35,5 @@ class TrainingConfig:
     use_4bit_qlora: bool = True
 
 paths = PathsConfig()
+synthesis = SynthesisConfig()
 training = TrainingConfig()
