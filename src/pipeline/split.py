@@ -29,16 +29,27 @@ class DatasetSplitter:
 
     def split(self) -> None:
         items = self._load_lines()
-        random.shuffle(items)
 
-        n = len(items)
-        n_train = int(n * self.train_ratio)
-        n_val = int(n * self.val_ratio)
-        n_test = n - n_train - n_val
+        # Stratify by task type so train/val/test each keep the same
+        # skill_match / requirements / experience mix as the full dataset.
+        groups: dict = {}
+        for item in items:
+            groups.setdefault(item.get("task", "skill_match"), []).append(item)
 
-        train = items[:n_train]
-        val = items[n_train:n_train + n_val]
-        test = items[n_train + n_val:]
+        train, val, test = [], [], []
+        for task in sorted(groups):
+            group = groups[task]
+            random.shuffle(group)
+            n = len(group)
+            n_train = int(n * self.train_ratio)
+            n_val = int(n * self.val_ratio)
+            train += group[:n_train]
+            val += group[n_train:n_train + n_val]
+            test += group[n_train + n_val:]
+            print(f"  {task}: {n_train} train / {n_val} val / {n - n_train - n_val} test")
+
+        for part in (train, val, test):
+            random.shuffle(part)
 
         # 1. Save locally (Keeping your original functionality)
         self._write_jsonl(paths.train_file, train)

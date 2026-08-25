@@ -3,7 +3,7 @@
 import csv
 import json
 from typing import List, Dict, Any
-from src.core.schema import SkillsEvaluationWrapper
+from src.core.schema import SkillEvaluationDecision
 
 
 class CsvParser:
@@ -23,16 +23,16 @@ class JsonParser:
     def validate_json(text: str) -> bool:
         try:
             obj = json.loads(text)
-            SkillsEvaluationWrapper.model_validate(obj)
+            SkillEvaluationDecision.model_validate(obj)
             return True
         except Exception:
             return False
 
     @staticmethod
-    def parse_json(text: str) -> SkillsEvaluationWrapper:
+    def parse_json(text: str) -> SkillEvaluationDecision:
         obj = json.loads(text)
-        return SkillsEvaluationWrapper.model_validate(obj)
+        return SkillEvaluationDecision.model_validate(obj)
 
     @staticmethod
-    def to_json(model: SkillsEvaluationWrapper) -> str:
+    def to_json(model: SkillEvaluationDecision) -> str:
         return model.model_dump_json(indent=2)

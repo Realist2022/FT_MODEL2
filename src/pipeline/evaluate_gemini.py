@@ -6,18 +6,32 @@ from google.genai.errors import APIError
 from google import genai
 from dotenv import load_dotenv
 
-from src.core.schema import SkillsEvaluationWrapper
+from src.core.schema import (
+    JobRequirementsOutput,
+    OverallExperienceResponse,
+    SkillEvaluationDecision,
+)
 from src.pipeline.evaluate import JsonEvaluator
 
 load_dotenv()
 
 class GeminiRunner:
     """Handles generating completions via the Gemini 3.1 Flash-Lite API."""
-    
+
     def __init__(self):
         # Automatically picks up GEMINI_API_KEY from your environment variables
         self.client = genai.Client()
         self.model_name = "gemini-3.1-flash-lite"
+
+    @staticmethod
+    def _schema_for_prompt(prompt: str):
+        """Picks the response schema for the agent task, recognised by the
+        system prompt the evaluator prepends to the plain-text prompt."""
+        if prompt.startswith("Extract atomic technical and operational skill_names"):
+            return JobRequirementsOutput
+        if prompt.startswith("Extract and classify the candidate's professional work experience"):
+            return OverallExperienceResponse
+        return SkillEvaluationDecision
 
     def generate(self, prompt: str, max_retries: int = 3) -> str:
             """Sends the prompt to Gemini, enforces the Pydantic schema, and handles rate limits."""
@@ -32,7 +46,7 @@ class GeminiRunner:
                         config={
                             "response_mime_type": "application/json",
                             # Enforce exact Pydantic schema structure
-                            "response_schema": SkillsEvaluationWrapper,
+                            "response_schema": self._schema_for_prompt(prompt),
                         },
                     )
                     return response.text or "{}"
